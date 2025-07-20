@@ -27,7 +27,7 @@ if "zip_bytes" not in st.session_state:
 if "last_uploaded_name" not in st.session_state:
     st.session_state.last_uploaded_name = None
 
-uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "csv"])
 
 # Add choice for transformation
 transform_choice = st.radio(
@@ -46,7 +46,11 @@ if uploaded_file is not None:
 
     if st.button("Convert to Shapefile"):
         try:
-            df = pd.read_excel(excel_path)
+            if uploaded_file.name.lower().endswith(".csv"):
+                df = pd.read_csv(excel_path)
+            else:
+                df = pd.read_excel(excel_path)
+
             df.columns = [c.strip() for c in df.columns]
 
             polygons, names = [], []
