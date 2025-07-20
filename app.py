@@ -7,8 +7,19 @@ import zipfile
 import os
 from io import BytesIO
 
+# Transformation helper
+def transform_coord(value):
+    step1 = value / 100.0
+    step2 = int(step1)
+    step3 = step1 - step2
+    step4 = step3 * 100
+    step5 = step4 * 100 / 60
+    step6 = step5 / 100
+    step7 = step6 + step2
+    return step7
+
 st.title("Excel to shapefile converter")
-st.write("Upload your Excel file, and download a shapefile with polygons.")
+st.write("Upload your Excel file, choose whether data is raw or already transformed, and download a shapefile.")
 
 # Initialize session state variables
 if "zip_bytes" not in st.session_state:
@@ -18,13 +29,17 @@ if "last_uploaded_name" not in st.session_state:
 
 uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
 
-# Detect a *new* upload and clear previous state
+# Add choice for transformation
+transform_choice = st.radio(
+    "Is your uploaded sheet already transformed?",
+    ["Already transformed", "Raw sheet (needs transformation)"]
+)
+
 if uploaded_file is not None:
     if uploaded_file.name != st.session_state.last_uploaded_name:
         st.session_state.zip_bytes = None
         st.session_state.last_uploaded_name = uploaded_file.name
 
-    # Save uploaded file to a temp location
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp.write(uploaded_file.getvalue())
         excel_path = tmp.name
@@ -41,6 +56,10 @@ if uploaded_file is not None:
                     lat = row.get(f"Lat{i}")
                     lon = row.get(f"Long{i}")
                     if pd.notna(lat) and pd.notna(lon):
+                        # Apply transformation only if raw
+                        if transform_choice == "Raw sheet (needs transformation)":
+                            lat = transform_coord(lat)
+                            lon = transform_coord(lon)
                         coords.append((lon, lat))
                 if coords and coords[0] != coords[-1]:
                     coords.append(coords[0])
@@ -55,7 +74,6 @@ if uploaded_file is not None:
 
             gdf = gpd.GeoDataFrame({"TempCode": names, "geometry": polygons}, crs="EPSG:4326")
 
-            # Save to zip in memory
             with tempfile.TemporaryDirectory() as tmpdir:
                 shp_path = os.path.join(tmpdir, "output.shp")
                 gdf.to_file(shp_path, driver="ESRI Shapefile")
@@ -68,17 +86,16 @@ if uploaded_file is not None:
                 zip_buffer.seek(0)
 
                 st.session_state.zip_bytes = zip_buffer.getvalue()
-            st.success("Shapefile created successfully!")
+            st.success("✅ Shapefile created successfully!")
 
         except Exception as e:
             st.error(f"Error: {e}")
 
-# Show download button if zip bytes exist
 if st.session_state.zip_bytes is not None:
     st.download_button(
         label="⬇️ Download Shapefile (ZIP)",
         data=st.session_state.zip_bytes,
         file_name="shapefile_output.zip",
         mime="application/zip",
-        key="download-btn" 
+        key="download-btn"
     )
