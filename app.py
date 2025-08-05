@@ -6,6 +6,29 @@ import tempfile
 import zipfile
 import os
 from io import BytesIO
+import ee
+import geemap
+
+from google.oauth2 import service_account
+
+def init_ee():
+    creds_dict = dict(st.secrets["GEE"])
+
+    scopes = [
+        "https://www.googleapis.com/auth/earthengine.readonly",
+        "https://www.googleapis.com/auth/earthengine",
+        "https://www.googleapis.com/auth/devstorage.full_control"
+    ]
+
+    google_creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=scopes
+    )
+
+    ee.Initialize(google_creds, project=creds_dict["project_id"])
+
+# Initialize Earth Engine via service account
+init_ee()
 
 # Transformation helper
 def transform_coord(value):
@@ -26,6 +49,9 @@ if "zip_bytes" not in st.session_state:
     st.session_state.zip_bytes = None
 if "last_uploaded_name" not in st.session_state:
     st.session_state.last_uploaded_name = None
+if "composite_image_bytes" not in st.session_state:
+    st.session_state["composite_image_bytes"] = None
+
 
 uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "csv"])
 
@@ -95,7 +121,88 @@ if uploaded_file is not None:
         except Exception as e:
             st.error(f"Error: {e}")
 
-if st.session_state.zip_bytes is not None:
+st.header("Sentinel-2 Image Downloader")
+st.write("Enter bounding box and date range to download a cloud-free 4-band Sentinel-2 image composite.")
+
+with st.form("sentinel_form"):
+    col1, col2 = st.columns(2)
+    with col1:
+        lat1 = st.number_input("Top Latitude", value=10.02)
+        lon1 = st.number_input("Left Longitude", value=76.24)
+    with col2:
+        lat2 = st.number_input("Bottom Latitude", value=9.98)
+        lon2 = st.number_input("Right Longitude", value=76.28)
+
+    start_date = st.date_input("Start Date")
+    end_date = st.date_input("End Date")
+
+    submit_btn = st.form_submit_button("Get Cloud-Free Composite")
+
+if submit_btn:
+    st.session_state["composite_image_bytes"] = None  # Reset previous output
+
+    try:
+        bounds = ee.Geometry.Rectangle([lon1, lat2, lon2, lat1])  # Left, Bottom, Right, Top
+
+        def mask_clouds(image):
+            qa = image.select("QA60")
+            cloud_bit_mask = 1 << 10
+            cirrus_bit_mask = 1 << 11
+            mask = qa.bitwiseAnd(cloud_bit_mask).eq(0).And(
+                qa.bitwiseAnd(cirrus_bit_mask).eq(0)
+            )
+            return image.updateMask(mask).copyProperties(image, ["system:time_start"])
+
+        collection = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(bounds)
+            .filterDate(str(start_date), str(end_date))
+            .map(mask_clouds)
+        )
+
+        count = collection.size().getInfo()
+
+        if count == 0:
+            st.error("No suitable cloud-free pixels found in the given range and region.")
+        else:
+            st.write(f"Found {count} valid (masked) image(s) in the date range.")
+            with st.spinner("Processing image for download..."):
+                composite = collection.select(["B4", "B3", "B2", "B8"]).median()
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    out_path = os.path.join(tmpdir, "sentinel_image.tif")
+
+                    try:
+                        geemap.ee_export_image(
+                            composite,
+                            filename=out_path,
+                            scale=10,
+                            region=bounds,
+                            file_per_band=False,
+                        )
+
+                        if os.path.exists(out_path):
+                            with open(out_path, "rb") as f:
+                                st.session_state["composite_image_bytes"] = f.read()
+                        else:
+                            st.error("Image export failed. Try a smaller region or larger scale value.")
+                    except Exception as export_error:
+                        st.error(f"Image export failed: {export_error}")
+
+    except Exception as e:
+        st.error(f"Error retrieving image: {e}")
+
+if st.session_state.get("composite_image_bytes") is not None:
+    st.download_button(
+        label="⬇️ Download Sentinel Image (GeoTIFF)",
+        data=st.session_state["composite_image_bytes"],
+        file_name="sentinel_image.tif",
+        mime="image/tiff"
+    )
+    st.success("✅ Cloud-free composite image is ready for download!")
+
+# Keep shapefile download section as-is if using both tools in same app
+if st.session_state.get("zip_bytes") is not None:
     st.download_button(
         label="⬇️ Download Shapefile (ZIP)",
         data=st.session_state.zip_bytes,
