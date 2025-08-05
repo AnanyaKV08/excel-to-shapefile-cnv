@@ -6,3 +6,4 @@ openpyxl
 fiona
 earthengine-api
 geemap
+rasterio
