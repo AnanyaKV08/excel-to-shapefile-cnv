@@ -165,7 +165,7 @@ if submit_btn:
         if count == 0:
             st.error("No suitable cloud-free pixels found in the given range and region.")
         else:
-            st.write(f"Found {count} valid (masked) image(s) in the date range.")
+            st.write(f"Found {count} valid (masked) images in the date range.")
             with st.spinner("Processing image for download..."):
                 composite = collection.select(["B4", "B3", "B2", "B8"]).median()
 
