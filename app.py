@@ -8,6 +8,9 @@ import os
 from io import BytesIO
 import ee
 import geemap
+from rasterio.merge import merge as merge_rasters
+import rasterio
+import numpy as np
 
 from google.oauth2 import service_account
 
@@ -166,13 +169,18 @@ if submit_btn:
             st.error("No suitable cloud-free pixels found in the given range and region.")
         else:
             st.write(f"Found {count} valid (masked) images in the date range.")
-            with st.spinner("Processing final image for download..."):
+            with st.spinner("Processing image for download..."):
+                def should_tile(lat1, lat2, lon1, lon2):
+                    # Rough EE export limit: ~50km x 50km at 10m resolution
+                    return abs(lat1 - lat2) > 0.45 or abs(lon1 - lon2) > 0.45
+
                 composite = collection.select(["B4", "B3", "B2", "B8"]).median()
 
                 with tempfile.TemporaryDirectory() as tmpdir:
                     out_path = os.path.join(tmpdir, "sentinel_image.tif")
 
-                    try:
+                    if not should_tile(lat1, lat2, lon1, lon2):
+                        # Normal export
                         geemap.ee_export_image(
                             composite,
                             filename=out_path,
@@ -180,14 +188,58 @@ if submit_btn:
                             region=bounds,
                             file_per_band=False,
                         )
+                    else:
+                        st.warning("⚠️ Large area detected. Processing as a tiled composite...")
 
-                        if os.path.exists(out_path):
-                            with open(out_path, "rb") as f:
-                                st.session_state["composite_image_bytes"] = f.read()
+                        step = 0.2 
+                        tiles = []
+                        for lat_start in np.arange(min(lat1, lat2), max(lat1, lat2), step):
+                            for lon_start in np.arange(min(lon1, lon2), max(lon1, lon2), step):
+                                tile_bounds = ee.Geometry.Rectangle([
+                                    lon_start,
+                                    lat_start,
+                                    min(lon_start + step, max(lon1, lon2)),
+                                    min(lat_start + step, max(lat1, lat2))
+                                ])
+                                tile_path = os.path.join(tmpdir, f"tile_{lat_start}_{lon_start}.tif")
+                                try:
+                                    geemap.ee_export_image(
+                                        composite,
+                                        filename=tile_path,
+                                        scale=10,
+                                        region=tile_bounds,
+                                        file_per_band=False,
+                                    )
+                                    if os.path.exists(tile_path):
+                                        tiles.append(tile_path)
+                                except Exception as e:
+                                    st.warning(f"Tile {lat_start:.2f},{lon_start:.2f} failed: {e}")
+
+                        if not tiles:
+                            st.error("Image export failed. No tiles were generated.")
                         else:
-                            st.error("Image export failed. Try a smaller region or larger scale value.")
-                    except Exception as export_error:
-                        st.error(f"Image export failed: {export_error}")
+
+                            # Merge tiles
+                            src_files_to_mosaic = [rasterio.open(tp) for tp in tiles]
+                            mosaic, out_trans = merge_rasters(src_files_to_mosaic)
+
+                            out_meta = src_files_to_mosaic[0].meta.copy()
+                            out_meta.update({
+                                "driver": "GTiff",
+                                "height": mosaic.shape[1],
+                                "width": mosaic.shape[2],
+                                "transform": out_trans,
+                            })
+
+                            with rasterio.open(out_path, "w", **out_meta) as dest:
+                                dest.write(mosaic)
+
+                    # Read result for download
+                    if os.path.exists(out_path):
+                        with open(out_path, "rb") as f:
+                            st.session_state["composite_image_bytes"] = f.read()
+                    else:
+                        st.error("Image export failed. Try a smaller region or larger scale value.")
 
     except Exception as e:
         st.error(f"Error retrieving image: {e}")
