@@ -8,8 +8,7 @@ import os
 from io import BytesIO
 import ee
 import geemap
-from rasterio.merge import merge as merge_rasters
-import rasterio
+import math
 import numpy as np
 
 from google.oauth2 import service_account
@@ -44,6 +43,53 @@ def transform_coord(value):
     step7 = step6 + step2
     return step7
 
+def mask_clouds_qa60(image):
+    # Classic QA60 mask: remove cloud + cirrus
+    qa = image.select("QA60")
+    mask = qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0))
+    return image.updateMask(mask).copyProperties(image, ["system:time_start"])
+
+def build_composite(bounds, start_date, end_date):
+    # Returns 4-band (B4,B3,B2,B8) cloud-masked median as int16 (0..10000)
+    col = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(bounds)
+        .filterDate(str(start_date), str(end_date))
+        .map(mask_clouds_qa60)
+    )
+    return col.select(["B4", "B3", "B2", "B8"]).median().toInt16()
+
+def estimate_pixels(lat1, lat2, lon1, lon2, scale_m=10):
+    # Very rough pixel estimate (good enough to decide tiling)
+    phi = (lat1 + lat2) / 2.0
+    h_m = abs(lat1 - lat2) * 110_540.0
+    w_m = abs(lon1 - lon2) * 111_320.0 * max(0.1, math.cos(math.radians(phi)))
+    return (h_m / scale_m) * (w_m / scale_m)
+
+def safe_tile_steps(lat1, lat2, lon1, lon2, scale_m=10, bands=4, bytes_per_sample=2, limit_mb=48):
+    """
+    Pick lat/lon step so each tile stays well under the ~50 MB synchronous download cap.
+    Assumes int16 outputs (2 bytes per sample).
+    """
+    limit_bytes = limit_mb * 1024 * 1024
+    safe_side_m = scale_m * math.sqrt(limit_bytes / float(bands * bytes_per_sample))
+    safe_side_m *= 0.70  # margin (~30%)
+    # meters -> degrees
+    phi = (lat1 + lat2) / 2.0
+    dlat = safe_side_m / 110_540.0
+    dlon = safe_side_m / (111_320.0 * max(0.1, math.cos(math.radians(phi))))
+    # never let a tile get too big (also avoids EE reprojection issues)
+    return min(dlat, 0.35), min(dlon, 0.35)
+
+def arange_edges(start, stop, step):
+    vals = []
+    v = start
+    while v < stop - 1e-12:
+        vals.append(v)
+        v += step
+    vals.append(stop)
+    return vals
+
 st.title("Excel to shapefile converter")
 st.write("Upload your Excel file, choose whether data is raw or already transformed, and download a shapefile.")
 
@@ -54,7 +100,8 @@ if "last_uploaded_name" not in st.session_state:
     st.session_state.last_uploaded_name = None
 if "composite_image_bytes" not in st.session_state:
     st.session_state["composite_image_bytes"] = None
-
+if "tiles_zip_bytes" not in st.session_state:
+    st.session_state["tiles_zip_bytes"] = None
 
 uploaded_file = st.file_uploader("Upload Excel or CSV", type=["xlsx", "csv"])
 
@@ -142,104 +189,87 @@ with st.form("sentinel_form"):
     submit_btn = st.form_submit_button("Get Cloud-Free Composite")
 
 if submit_btn:
-    st.session_state["composite_image_bytes"] = None  # Reset previous output
+    st.session_state["composite_image_bytes"] = None
+    st.session_state["tiles_zip_bytes"] = None
 
     try:
-        bounds = ee.Geometry.Rectangle([lon1, lat2, lon2, lat1])  # Left, Bottom, Right, Top
+        bounds = ee.Geometry.Rectangle([lon1, lat2, lon2, lat1])
+        composite = build_composite(bounds, start_date, end_date)  # int16, 4 bands
 
-        def mask_clouds(image):
-            qa = image.select("QA60")
-            cloud_bit_mask = 1 << 10
-            cirrus_bit_mask = 1 << 11
-            mask = qa.bitwiseAnd(cloud_bit_mask).eq(0).And(
-                qa.bitwiseAnd(cirrus_bit_mask).eq(0)
-            )
-            return image.updateMask(mask).copyProperties(image, ["system:time_start"])
+        # Decide: single file or tiled
+        px_est = estimate_pixels(lat1, lat2, lon1, lon2, scale_m=10)
+        # Very conservative: if > ~25–30M px, tile to avoid 50MB cap
+        needs_tiling = px_est > 2.8e7
 
-        collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(bounds)
-            .filterDate(str(start_date), str(end_date))
-            .map(mask_clouds)
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if not needs_tiling:
+                # ---- Single export (small AOI) ----
+                out_path = os.path.join(tmpdir, "sentinel_image.tif")
+                geemap.ee_export_image(
+                    composite,
+                    filename=out_path,
+                    scale=10,
+                    region=bounds,
+                    file_per_band=False,
+                )
+                if os.path.exists(out_path):
+                    with open(out_path, "rb") as f:
+                        st.session_state["composite_image_bytes"] = f.read()
+                    st.success("✅ Cloud-free composite image is ready for download!")
+                else:
+                    st.error("Image export failed. Try a smaller region or a longer date range.")
+            else:
+                # ---- Tiled export (big AOI): split and ZIP all tiles ----
+                st.warning("Large AOI detected → exporting as multiple tiles and zipping them for download.")
 
-        count = collection.size().getInfo()
+                dlat, dlon = safe_tile_steps(lat1, lat2, lon1, lon2, scale_m=10, bands=4, bytes_per_sample=2, limit_mb=48)
+                lat_min, lat_max = min(lat1, lat2), max(lat1, lat2)
+                lon_min, lon_max = min(lon1, lon2), max(lon1, lon2)
+                lat_edges = arange_edges(lat_min, lat_max, dlat)
+                lon_edges = arange_edges(lon_min, lon_max, dlon)
 
-        if count == 0:
-            st.error("No suitable cloud-free pixels found in the given range and region.")
-        else:
-            st.write(f"Found {count} valid (masked) images in the date range.")
-            with st.spinner("Processing image for download..."):
-                def should_tile(lat1, lat2, lon1, lon2):
-                    # Rough EE export limit: ~50km x 50km at 10m resolution
-                    return abs(lat1 - lat2) > 0.45 or abs(lon1 - lon2) > 0.45
+                attempts = 0
+                successes = 0
+                failures = 0
+                tile_files = []
 
-                composite = collection.select(["B4", "B3", "B2", "B8"]).median()
+                for yi in range(len(lat_edges) - 1):
+                    for xi in range(len(lon_edges) - 1):
+                        ymin, ymax = lat_edges[yi], lat_edges[yi + 1]
+                        xmin, xmax = lon_edges[xi], lon_edges[xi + 1]
+                        tile_geom = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+                        tile_name = f"tile_r{yi:03d}_c{xi:03d}.tif"
+                        tile_path = os.path.join(tmpdir, tile_name)
+                        attempts += 1
+                        try:
+                            geemap.ee_export_image(
+                                composite,
+                                filename=tile_path,
+                                scale=10,
+                                region=tile_geom,
+                                file_per_band=False,
+                            )
+                            if os.path.exists(tile_path) and os.path.getsize(tile_path) > 0:
+                                tile_files.append(tile_path)
+                                successes += 1
+                            else:
+                                failures += 1
+                        except Exception:
+                            failures += 1
 
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    out_path = os.path.join(tmpdir, "sentinel_image.tif")
+                st.info(f"Tiling complete. Attempts: {attempts}, succeeded: {successes}, failed: {failures}")
 
-                    if not should_tile(lat1, lat2, lon1, lon2):
-                        # Normal export
-                        geemap.ee_export_image(
-                            composite,
-                            filename=out_path,
-                            scale=10,
-                            region=bounds,
-                            file_per_band=False,
-                        )
-                    else:
-                        st.warning("⚠️ Large area detected. Processing as a tiled composite...")
-
-                        step = 0.2 
-                        tiles = []
-                        for lat_start in np.arange(min(lat1, lat2), max(lat1, lat2), step):
-                            for lon_start in np.arange(min(lon1, lon2), max(lon1, lon2), step):
-                                tile_bounds = ee.Geometry.Rectangle([
-                                    lon_start,
-                                    lat_start,
-                                    min(lon_start + step, max(lon1, lon2)),
-                                    min(lat_start + step, max(lat1, lat2))
-                                ])
-                                tile_path = os.path.join(tmpdir, f"tile_{lat_start}_{lon_start}.tif")
-                                try:
-                                    geemap.ee_export_image(
-                                        composite,
-                                        filename=tile_path,
-                                        scale=10,
-                                        region=tile_bounds,
-                                        file_per_band=False,
-                                    )
-                                    if os.path.exists(tile_path):
-                                        tiles.append(tile_path)
-                                except Exception as e:
-                                    st.warning(f"Tile {lat_start:.2f},{lon_start:.2f} failed: {e}")
-
-                        if not tiles:
-                            st.error("Image export failed. No tiles were generated.")
-                        else:
-
-                            # Merge tiles
-                            src_files_to_mosaic = [rasterio.open(tp) for tp in tiles]
-                            mosaic, out_trans = merge_rasters(src_files_to_mosaic)
-
-                            out_meta = src_files_to_mosaic[0].meta.copy()
-                            out_meta.update({
-                                "driver": "GTiff",
-                                "height": mosaic.shape[1],
-                                "width": mosaic.shape[2],
-                                "transform": out_trans,
-                            })
-
-                            with rasterio.open(out_path, "w", **out_meta) as dest:
-                                dest.write(mosaic)
-
-                    # Read result for download
-                    if os.path.exists(out_path):
-                        with open(out_path, "rb") as f:
-                            st.session_state["composite_image_bytes"] = f.read()
-                    else:
-                        st.error("Image export failed. Try a smaller region or larger scale value.")
+                if not tile_files:
+                    st.error("All tile exports failed. Try shrinking the AOI or widening the date range.")
+                else:
+                    # Make a ZIP of all tiles
+                    zip_buffer = BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fp in tile_files:
+                            zf.write(fp, arcname=os.path.basename(fp))
+                    zip_buffer.seek(0)
+                    st.session_state["tiles_zip_bytes"] = zip_buffer.getvalue()
+                    st.success("✅ Tiles are ready. Download the ZIP below.")
 
     except Exception as e:
         st.error(f"Error retrieving image: {e}")
@@ -249,11 +279,20 @@ if st.session_state.get("composite_image_bytes") is not None:
         label="⬇️ Download Sentinel Image (GeoTIFF)",
         data=st.session_state["composite_image_bytes"],
         file_name="sentinel_image.tif",
-        mime="image/tiff"
+        mime="image/tiff",
+        key="dl_single",
     )
-    st.success("✅ Cloud-free composite image is ready for download!")
 
-# Keep shapefile download section as-is if using both tools in same app
+if st.session_state.get("tiles_zip_bytes") is not None:
+    st.download_button(
+        label="⬇️ Download Tiled Sentinel Image (ZIP)",
+        data=st.session_state["tiles_zip_bytes"],
+        file_name="sentinel_tiles.zip",
+        mime="application/zip",
+        key="dl_tiles",
+    )
+
+# Shapefile download (unchanged)
 if st.session_state.get("zip_bytes") is not None:
     st.download_button(
         label="⬇️ Download Shapefile (ZIP)",
