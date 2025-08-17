@@ -32,7 +32,7 @@ def init_ee():
 # Initialize Earth Engine via service account
 init_ee()
 
-# Transformation helper
+# ---------------- Helpers ----------------
 def transform_coord(value):
     step1 = value / 100.0
     step2 = int(step1)
@@ -90,6 +90,33 @@ def arange_edges(start, stop, step):
     vals.append(stop)
     return vals
 
+def clear_fraction_qa60(bounds, start_date, end_date, sample_scale=500):
+    """
+    Fraction of AOI pixels that have at least one clear (QA60 cloud+cirrus-free) observation
+    within the date range. Computed at coarse resolution for speed.
+    """
+    col = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(bounds)
+        .filterDate(str(start_date), str(end_date))
+    )
+
+    def clear01(img):
+        qa = img.select("QA60")
+        is_clear = qa.bitwiseAnd(1 << 10).eq(0).And(qa.bitwiseAnd(1 << 11).eq(0))
+        return is_clear.rename("clear").unmask(0)
+
+    clears = col.map(clear01)
+    any_clear = clears.max()  # per-pixel: 1 if clear in any image, else 0
+    stats = any_clear.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=bounds,
+        scale=sample_scale,      # coarse sampling for speed
+        maxPixels=1e8
+    )
+    return ee.Number(stats.get("clear"))
+
+# ---------------- UI ----------------
 st.title("Excel to shapefile converter")
 st.write("Upload your Excel file, choose whether data is raw or already transformed, and download a shapefile.")
 
@@ -196,6 +223,22 @@ if submit_btn:
         bounds = ee.Geometry.Rectangle([lon1, lat2, lon2, lat1])
         composite = build_composite(bounds, start_date, end_date)  # int16, 4 bands
 
+        # ---- NEW: quick NoData advisory (coarse) ----
+        try:
+            frac_clear = clear_fraction_qa60(bounds, start_date, end_date, sample_scale=500).getInfo()
+            if frac_clear is None:
+                frac_clear = 0.0
+            st.caption(f"Estimated clear coverage: ~{round(100*frac_clear,1)}% of AOI has at least one clear observation.")
+            if frac_clear < 0.98:
+                st.warning(
+                    "Some pixels in this AOI may have no clear observations in the given date range. "
+                    "The output GeoTIFF can contain NoData (black) in those areas. "
+                    "Consider widening the date range for fuller coverage."
+                )
+        except Exception:
+            # Non-blocking; continue with export even if this estimate fails
+            pass
+
         # Decide: single file or tiled
         px_est = estimate_pixels(lat1, lat2, lon1, lon2, scale_m=10)
         # Very conservative: if > ~25–30M px, tile to avoid 50MB cap
@@ -274,6 +317,7 @@ if submit_btn:
     except Exception as e:
         st.error(f"Error retrieving image: {e}")
 
+# ---------------- Downloads ----------------
 if st.session_state.get("composite_image_bytes") is not None:
     st.download_button(
         label="⬇️ Download Sentinel Image (GeoTIFF)",
